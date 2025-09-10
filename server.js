@@ -6,35 +6,39 @@ import { Telegraf } from 'telegraf';
 import crypto from 'crypto';
 
 const {
-  BOT_TOKEN,             // токен бота (не публиковать)
-  ADMIN_CHAT_ID,         // числовой chat_id админа (/id в боте)
+  BOT_TOKEN,              // обязательный
+  ADMIN_CHAT_ID,          // chat_id админа (число). Если не задан, дублируем в ответ пользователю
   PORT = 3000,
-  USE_WEBHOOK = '0',     // '1' чтобы включить webhook
-  WEBHOOK_URL = ''       // базовый HTTPS URL сервера (без хвоста)
+  USE_WEBHOOK = '0',      // '1' => webhook, иначе polling
+  WEBHOOK_URL = '',       // https://your-domain.tld (без хвоста, НО с https)
+  WEBHOOK_SECRET = ''     // опционально: секрет для X-Telegram-Bot-Api-Secret-Token
 } = process.env;
 
-if (!BOT_TOKEN) throw new Error('Set BOT_TOKEN env');
+if (!BOT_TOKEN) throw new Error('Set BOT_TOKEN in .env');
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// ===== Команды бота (меню) =====
+// ===== Меню бота =====
 bot.telegram.setMyCommands([
   { command: 'start', description: 'Запустить бота' },
   { command: 'id',    description: 'Показать мой chat_id' }
 ]).catch(console.error);
 
-// ===== Узнаём username бота для deep-link =====
+// ===== username бота (ленивая загрузка, чтобы не было гонок) =====
 let BOT_USER = '';
-bot.telegram.getMe()
-  .then(me => { BOT_USER = me.username; console.log('[getMe]', me.username); })
-  .catch(err => console.error('[getMe] failed:', err));
+async function ensureBotUsername() {
+  if (BOT_USER) return BOT_USER;
+  const me = await bot.telegram.getMe();
+  BOT_USER = me?.username || '';
+  return BOT_USER;
+}
 
 // ===== In-memory store токенов =====
 const store = new Map(); // token -> { payload, exp }
 const TTL_MS = 1000 * 60 * 30; // 30 минут
 
 function putPayload(obj) {
-  const token = crypto.randomBytes(6).toString('base64url'); // короткий токен
+  const token = crypto.randomBytes(6).toString('base64url'); // короткий
   store.set(token, { payload: obj, exp: Date.now() + TTL_MS });
   return token;
 }
@@ -45,15 +49,18 @@ function takePayload(token) {
   if (rec.exp < Date.now()) return null;
   return rec.payload;
 }
+
 function esc(s = '') {
-  // экранирование под MarkdownV2
+  // экранирование для MarkdownV2
   return String(s).replace(/[_*\[\]()`~>#+\-=|{}.!\\]/g, '\\$&');
 }
+
 function fmtOrder(p) {
+  const pr = p.program || {};
   return [
     '*Новая заявка*',
-    `*Программа:* ${esc(p.program?.title || '')}${p.program?.id ? ` (${esc(p.program.id)})` : ''}`,
-    `*Страница:* ${esc(p.program?.url || '')}`,
+    (pr.title || pr.id) ? `*Программа:* ${esc(pr.title || '')}${pr.id ? ` (${esc(pr.id)})` : ''}` : '',
+    pr.url ? `*Страница:* ${esc(pr.url)}` : '',
     `*Имя:* ${esc(p.name || '')}`,
     `*Контакт клиента:* ${esc(p.contact || '')}`,
     `*Дата:* ${esc(p.date || '')}`,
@@ -65,7 +72,7 @@ function fmtOrder(p) {
 // ===== Хэндлеры бота =====
 bot.start(async (ctx) => {
   const token = (ctx.startPayload || '').trim();
-  console.log('[START]', { from: ctx.from?.id, token });
+  console.log('[START]', { from: ctx.from?.id, tokenPresent: Boolean(token) });
 
   if (!token) {
     return ctx.reply(
@@ -81,13 +88,13 @@ bot.start(async (ctx) => {
     );
   }
 
-  const p = takePayload(token);
-  console.log('[PAYLOAD]', p);
-  if (!p) return ctx.reply('⚠️ Срок действия ссылки истёк. Отправьте заявку ещё раз с сайта.');
+  const payload = takePayload(token);
+  if (!payload) {
+    return ctx.reply('⚠️ Срок действия ссылки истёк. Отправьте заявку ещё раз с сайта.');
+  }
 
-  const text = fmtOrder(p);
+  const text = fmtOrder(payload);
   const adminId = Number(ADMIN_CHAT_ID || ctx.chat?.id);
-  console.log('[SEND->ADMIN]', adminId);
 
   try {
     await ctx.telegram.sendMessage(adminId, text, {
@@ -95,7 +102,7 @@ bot.start(async (ctx) => {
       disable_web_page_preview: true
     });
   } catch (e) {
-    console.error('Send to admin failed:', e);
+    console.error('[SEND->ADMIN] failed:', e);
   }
 
   await ctx.reply('Спасибо! Ваша заявка отправлена. Я свяжусь с вами в ближайшее время ✅');
@@ -107,28 +114,93 @@ bot.catch((err) => console.error('Bot error:', err));
 // ===== HTTP-сервер =====
 const app = express();
 
-// Строгий CORS под GitHub Pages
+// Если за прокси (Render/Heroku/Nginx) — нужно для корректной схемы HTTPS и доверия к заголовкам
+app.set('trust proxy', 1);
+
+// CORS: GitHub Pages + локалка
+const CORS_WHITELIST = [
+  'https://3763024irina.github.io',
+  'https://3763024irina.github.io/voyages-de-l-auteur',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  'http://localhost:5173',    // vite
+  'http://127.0.0.1:5173'
+];
+
 app.use(cors({
-  origin: [
-    'https://3763024irina.github.io',
-    'https://3763024irina.github.io/voyages-de-l-auteur'
-  ],
-  methods: ['GET', 'POST']
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // curl / сервер-сервер
+    if (CORS_WHITELIST.includes(origin)) return cb(null, true);
+    return cb(new Error(`CORS blocked: ${origin}`));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type'],
+  credentials: false
 }));
-app.use(express.json());
+
+// Обязателен обработчик preflight
+app.options('*', (req, res) => res.sendStatus(204));
+
+// JSON парсер (с запасом размера)
+app.use(express.json({ limit: '200kb' }));
 
 app.get('/health', (_, res) => res.json({ ok: true }));
 
-app.post('/prestart', (req, res) => {
-  const b = req.body || {};
-  const required = ['name', 'contact', 'date', 'guests', 'message', 'program'];
-  for (const k of required) {
-    if (!b[k]) return res.status(400).json({ ok: false, error: `Missing ${k}` });
+// Простой пинг для проверки CORS/методов
+app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
+app.post('/prestart', async (req, res) => {
+  try {
+    const b = req.body || {};
+    // Разрешим как объект, так и «плоские» поля для program
+    const program = b.program && typeof b.program === 'object'
+      ? b.program
+      : {
+          id: b.program_id || b.programId || '',
+          title: b.program_title || b.programTitle || '',
+          url: b.program_url || b.programUrl || ''
+        };
+
+    const payload = {
+      name: String(b.name || '').trim(),
+      contact: String(b.contact || '').trim(),
+      date: String(b.date || '').trim(),
+      guests: String(b.guests || '').trim(),
+      message: String(b.message || '').trim(),
+      program: {
+        id: String(program.id || '').trim(),
+        title: String(program.title || '').trim(),
+        url: String(program.url || '').trim()
+      }
+    };
+
+    // Строгая валидация (как у тебя), но с нормальными ошибками
+    const required = ['name', 'contact', 'date', 'guests', 'message'];
+    for (const k of required) {
+      if (!payload[k]) {
+        return res.status(400).json({ ok: false, error: `Missing ${k}` });
+      }
+    }
+    // program можно не делать строго обязательным, но если есть — красиво отображаем
+    // если хочешь строго: раскомментируй следующую строку
+    // if (!(payload.program.title || payload.program.id || payload.program.url)) return res.status(400).json({ ok: false, error: 'Missing program' });
+
+    const token = putPayload(payload);
+
+    // Получим username лениво, чтобы не было гонок
+    let username = BOT_USER;
+    if (!username) {
+      try { username = await ensureBotUsername(); } catch (e) { console.error('[getMe lazy] failed:', e); }
+    }
+
+    const url = username ? `https://t.me/${username}?start=${token}` : null;
+    console.log('[PRESTART]', { token, hasUrl: Boolean(url) });
+
+    return res.json({ ok: true, token, url });
+  } catch (e) {
+    console.error('[PRESTART] error:', e);
+    return res.status(500).json({ ok: false, error: 'Internal error' });
   }
-  const token = putPayload(b);
-  const url = BOT_USER ? `https://t.me/${BOT_USER}?start=${token}` : null;
-  console.log('[PRESTART]', { token, hasUrl: Boolean(url) });
-  res.json({ ok: true, token, url });
 });
 
 // Очистка просроченных токенов
@@ -139,7 +211,7 @@ setInterval(() => {
 
 // ===== Запуск: webhook ИЛИ polling =====
 async function start() {
-  const server = app.listen(PORT, () => console.log(`HTTP on :${PORT}`));
+  const server = app.listen(Number(PORT), () => console.log(`HTTP on :${PORT}`));
 
   if (USE_WEBHOOK === '1') {
     if (!WEBHOOK_URL) {
@@ -147,7 +219,21 @@ async function start() {
       process.exit(1);
     }
     const secretPath = `/telegraf/${crypto.randomBytes(8).toString('hex')}`;
-    await bot.telegram.setWebhook(`${WEBHOOK_URL}${secretPath}`);
+
+    // Включим секретный заголовок (рекомендуется Телеграмом)
+    await bot.telegram.setWebhook(`${WEBHOOK_URL}${secretPath}`, {
+      secret_token: WEBHOOK_SECRET || undefined
+    });
+
+    app.use((req, res, next) => {
+      // Валидируем секрет (если задан)
+      if (WEBHOOK_SECRET && req.path.startsWith(secretPath)) {
+        const token = req.get('X-Telegram-Bot-Api-Secret-Token');
+        if (token !== WEBHOOK_SECRET) return res.sendStatus(401);
+      }
+      next();
+    });
+
     app.use(bot.webhookCallback(secretPath));
     console.log('Webhook set:', `${WEBHOOK_URL}${secretPath}`);
   } else {
